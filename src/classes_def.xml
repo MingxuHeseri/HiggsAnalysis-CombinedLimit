@@ -136,6 +136,12 @@
 	<class name="RooFourMuMassShapePdf2" />
 	<class name="RooGausExpPdf" />
 	<class name="RooGaussStepBernstein" />
+	<class name="RooGaussStepBernsteinFast" />
+	<class name="RooGaussStepExponential" />
+	<class name="RooGaussStepLaurent" />
+	<class name="RooGaussStepPowerLaw" />
+	<class name="RooModGaus" />
+	<class name="RooExpModGauss" />
 	<class name="RooLevelledExp" />
 	<class name="RooMultiPdf" />
 	<class name="RooParamKeysPdf" />

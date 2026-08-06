@@ -26,6 +26,10 @@
 #include "RooFit.h"
 
 #include "Riostream.h"
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <limits>
 #include <math.h>
 #include "TMath.h"
 #include "Math/SpecFunc.h"
@@ -832,4 +836,773 @@ Double_t RooGaussStepBernstein::analyticalIntegral(Int_t code,
   //cout << result << endl;
 
   return result;
+}
+
+namespace {
+
+  constexpr double kHZGStepSlope = 153.85;
+  constexpr double kHZGIntegralEpsilon = 1.e-10;
+
+  double positiveLowerLimit(double value) {
+    return std::max(value, std::numeric_limits<double>::min());
+  }
+
+  double stepWeight(double x, double step) {
+    return std::min(std::max((x - step) * kHZGStepSlope, 0.0), 1.0);
+  }
+
+  void copyRealList(RooListProxy& destination, const RooArgList& source,
+                    const char* className, const char* listName,
+                    const char* ownerName) {
+    for (RooAbsArg* argument : source) {
+      RooAbsReal* realArgument = dynamic_cast<RooAbsReal*>(argument);
+      if (!realArgument) {
+        std::cerr << className << "::ctor(" << ownerName << ") ERROR: "
+                  << listName << " entry is not a RooAbsReal" << std::endl;
+        assert(0);
+      }
+      destination.add(*realArgument);
+    }
+  }
+
+  double rawPowerIntegral(double lo, double hi, double power) {
+    if (hi <= lo || hi <= 0.) return 0.;
+    lo = positiveLowerLimit(lo);
+    if (std::fabs(power + 1.) < kHZGIntegralEpsilon) {
+      return std::log(hi / lo);
+    }
+    return (std::pow(hi, power + 1.) - std::pow(lo, power + 1.)) /
+           (power + 1.);
+  }
+
+  double powerDensity(double x, double power, double step, double xmax) {
+    if (x <= 0. || step <= 0. || xmax <= step) return 0.;
+    const double alpha = power + 1.;
+    if (std::fabs(alpha) < kHZGIntegralEpsilon) {
+      return 1. / (x * std::log(xmax / step));
+    }
+    const double denominator = std::pow(xmax, alpha) - std::pow(step, alpha);
+    if (denominator == 0.) return 0.;
+    return std::pow(x, power) * alpha / denominator;
+  }
+
+  double powerIntegral(double lo, double hi, double power,
+                       double step, double xmax) {
+    if (hi <= lo || hi <= 0. || step <= 0. || xmax <= step) return 0.;
+    lo = std::max(lo, step);
+    if (hi <= lo) return 0.;
+    const double alpha = power + 1.;
+    if (std::fabs(alpha) < kHZGIntegralEpsilon) {
+      return std::log(hi / lo) / std::log(xmax / step);
+    }
+    const double denominator = std::pow(xmax, alpha) - std::pow(step, alpha);
+    if (denominator == 0.) return 0.;
+    return (std::pow(hi, alpha) - std::pow(lo, alpha)) / denominator;
+  }
+
+  double powerFirstIntegral(double lo, double hi, double power,
+                            double step, double xmax) {
+    if (hi <= lo || hi <= 0. || step <= 0. || xmax <= step) return 0.;
+    lo = std::max(lo, step);
+    if (hi <= lo) return 0.;
+    const double alpha = power + 1.;
+    if (std::fabs(alpha) < kHZGIntegralEpsilon) {
+      return ((hi - lo) - step * std::log(hi / lo)) /
+             std::log(xmax / step);
+    }
+    const double denominator = std::pow(xmax, alpha) - std::pow(step, alpha);
+    if (denominator == 0.) return 0.;
+    return alpha / denominator *
+           (rawPowerIntegral(lo, hi, power + 1.) -
+            step * rawPowerIntegral(lo, hi, power));
+  }
+
+  double steppedPowerIntegral(double lo, double hi, double power,
+                              double step, double xmax) {
+    if (hi <= lo) return 0.;
+    const double rampLo = std::max(lo, step);
+    const double rampHi = std::min(hi, step + 1. / kHZGStepSlope);
+    double result = 0.;
+    if (rampHi > rampLo) {
+      result += kHZGStepSlope *
+                powerFirstIntegral(rampLo, rampHi, power, step, xmax);
+    }
+    const double tailLo = std::max(lo, step + 1. / kHZGStepSlope);
+    if (hi > tailLo) {
+      result += powerIntegral(tailLo, hi, power, step, xmax);
+    }
+    return result;
+  }
+
+  double rawExponentialIntegral(double lo, double hi, double slope,
+                                double step) {
+    if (hi <= lo) return 0.;
+    const double shiftedLo = lo - step;
+    const double shiftedWidth = hi - lo;
+    if (std::fabs(slope) < kHZGIntegralEpsilon) return shiftedWidth;
+    return std::exp(slope * shiftedLo) *
+           std::expm1(slope * shiftedWidth) / slope;
+  }
+
+  double rawExponentialFirstIntegral(double lo, double hi, double slope,
+                                     double step) {
+    if (hi <= lo) return 0.;
+    const double shiftedLo = lo - step;
+    const double shiftedHi = hi - step;
+    const double scaledWidth = slope * (shiftedHi - shiftedLo);
+
+    // The series avoids cancellation in the primitive for slopes close to 0.
+    if (std::fabs(scaledWidth) < 1.e-3) {
+      double result = 0.;
+      double factorial = 1.;
+      for (int order = 0; order <= 8; ++order) {
+        if (order > 0) factorial *= order;
+        result += std::pow(slope, order) / factorial *
+                  (std::pow(shiftedHi, order + 2) -
+                   std::pow(shiftedLo, order + 2)) / (order + 2.);
+      }
+      return result;
+    }
+
+    const auto primitive = [slope](double value) {
+      return std::exp(slope * value) *
+             (value / slope - 1. / (slope * slope));
+    };
+    return primitive(shiftedHi) - primitive(shiftedLo);
+  }
+
+  double exponentialDensity(double x, double slope, double step,
+                            double xmax) {
+    if (x < step || xmax <= step) return 0.;
+    const double width = xmax - step;
+    const double denominator = std::fabs(slope) < kHZGIntegralEpsilon
+                                 ? width
+                                 : std::expm1(slope * width) / slope;
+    if (denominator == 0.) return 0.;
+    return std::exp(slope * (x - step)) / denominator;
+  }
+
+  double exponentialIntegral(double lo, double hi, double slope,
+                             double step, double xmax) {
+    if (hi <= lo || xmax <= step) return 0.;
+    lo = std::max(lo, step);
+    if (hi <= lo) return 0.;
+    const double denominator = std::fabs(slope) < kHZGIntegralEpsilon
+                                 ? xmax - step
+                                 : std::expm1(slope * (xmax - step)) / slope;
+    if (denominator == 0.) return 0.;
+    return rawExponentialIntegral(lo, hi, slope, step) / denominator;
+  }
+
+  double exponentialFirstIntegral(double lo, double hi, double slope,
+                                  double step, double xmax) {
+    if (hi <= lo || xmax <= step) return 0.;
+    lo = std::max(lo, step);
+    if (hi <= lo) return 0.;
+    const double denominator = std::fabs(slope) < kHZGIntegralEpsilon
+                                 ? xmax - step
+                                 : std::expm1(slope * (xmax - step)) / slope;
+    if (denominator == 0.) return 0.;
+    return rawExponentialFirstIntegral(lo, hi, slope, step) / denominator;
+  }
+
+  double steppedExponentialIntegral(double lo, double hi, double slope,
+                                    double step, double xmax) {
+    if (hi <= lo) return 0.;
+    const double rampLo = std::max(lo, step);
+    const double rampHi = std::min(hi, step + 1. / kHZGStepSlope);
+    double result = 0.;
+    if (rampHi > rampLo) {
+      result += kHZGStepSlope *
+                exponentialFirstIntegral(rampLo, rampHi, slope, step, xmax);
+    }
+    const double tailLo = std::max(lo, step + 1. / kHZGStepSlope);
+    if (hi > tailLo) {
+      result += exponentialIntegral(tailLo, hi, slope, step, xmax);
+    }
+    return result;
+  }
+
+  double bernsteinIntegral(double lo, double hi, double step, double xmax,
+                           int degree, int index) {
+    if (degree < 0 || index < 0 || index > degree || hi <= lo || xmax <= step) {
+      return 0.;
+    }
+    const double width = xmax - step;
+    const double clippedLo = std::max(lo, step);
+    const double clippedHi = std::min(hi, xmax);
+    if (clippedHi <= clippedLo) return 0.;
+
+    const double zLo = std::min(std::max((clippedLo - step) / width, 0.), 1.);
+    const double zHi = std::min(std::max((clippedHi - step) / width, 0.), 1.);
+    const double cdfLo = zLo <= 0. ? 0. :
+                         zLo >= 1. ? 1. :
+                         TMath::BetaIncomplete(zLo, index + 1., degree - index + 1.);
+    const double cdfHi = zHi <= 0. ? 0. :
+                         zHi >= 1. ? 1. :
+                         TMath::BetaIncomplete(zHi, index + 1., degree - index + 1.);
+    return width * (cdfHi - cdfLo) / (degree + 1.);
+  }
+
+}
+
+ClassImp(RooGaussStepBernsteinFast)
+
+RooGaussStepBernsteinFast::RooGaussStepBernsteinFast() : _xmax(0.)
+{
+}
+
+RooGaussStepBernsteinFast::RooGaussStepBernsteinFast(
+    const char* name, const char* title, RooAbsReal& x,
+    RooAbsReal& stepThresh, const RooArgList& coefList, Double_t xmax):
+  RooAbsPdf(name, title),
+  _x("x", "Dependent", this, x),
+  _stepThresh("stepThresh", "value where the step starts", this, stepThresh),
+  _coefList("coefficients", "Bernstein coefficients", this),
+  _xmax(xmax)
+{
+  copyRealList(_coefList, coefList, "RooGaussStepBernsteinFast",
+               "coefficient", GetName());
+}
+
+RooGaussStepBernsteinFast::RooGaussStepBernsteinFast(
+    const RooGaussStepBernsteinFast& other, const char* name):
+  RooAbsPdf(other, name),
+  _x("x", this, other._x),
+  _stepThresh("stepThresh", this, other._stepThresh),
+  _coefList("coefficients", this, other._coefList),
+  _xmax(other._xmax)
+{
+}
+
+Double_t RooGaussStepBernsteinFast::evaluate() const
+{
+  const double x = _x;
+  const double step = _stepThresh;
+  if (_coefList.getSize() == 0 || _xmax <= step || x < step || x > _xmax) {
+    return 0.;
+  }
+
+  const double z = (x - step) / (_xmax - step);
+  const int degree = _coefList.getSize() - 1;
+  double result = 0.;
+  if (z <= 0.) {
+    return static_cast<RooAbsReal&>(_coefList[0]).getVal();
+  }
+  if (z >= 1.) {
+    return static_cast<RooAbsReal&>(_coefList[degree]).getVal();
+  }
+
+  // Build all basis values from the numerically safer endpoint.  This is
+  // O(n), avoids repeated Binomial()/pow() calls, and remains stable close
+  // to either endpoint for the orders used by the HZG fits.
+  if (z <= 0.5) {
+    double basis = std::pow(1. - z, degree);  // B_0,n
+    for (int i = 0; i <= degree; ++i) {
+      result += static_cast<RooAbsReal&>(_coefList[i]).getVal() * basis;
+      if (i < degree) {
+        basis *= (static_cast<double>(degree - i) / (i + 1)) *
+                 z / (1. - z);
+      }
+    }
+  } else {
+    double basis = std::pow(z, degree);  // B_n,n
+    for (int i = degree; i >= 0; --i) {
+      result += static_cast<RooAbsReal&>(_coefList[i]).getVal() * basis;
+      if (i > 0) {
+        basis *= (static_cast<double>(i) / (degree - i + 1)) *
+                 (1. - z) / z;
+      }
+    }
+  }
+  return result;
+}
+
+Int_t RooGaussStepBernsteinFast::getAnalyticalIntegral(
+    RooArgSet& allVars, RooArgSet& analVars, const char* /*rangeName*/) const
+{
+  if (matchArgs(allVars, analVars, _x)) return 1;
+  return 0;
+}
+
+Double_t RooGaussStepBernsteinFast::analyticalIntegral(
+    Int_t code, const char* rangeName) const
+{
+  if (code != 1 || _coefList.getSize() == 0) return 0.;
+  const double lo = _x.min(rangeName);
+  const double hi = _x.max(rangeName);
+  const int degree = _coefList.getSize() - 1;
+  double result = 0.;
+  for (int i = 0; i <= degree; ++i) {
+    const double coefficient =
+        static_cast<RooAbsReal&>(_coefList[i]).getVal();
+    result += coefficient *
+              bernsteinIntegral(lo, hi, _stepThresh, _xmax, degree, i);
+  }
+  return result;
+}
+
+ClassImp(RooGaussStepPowerLaw)
+ClassImp(RooGaussStepExponential)
+ClassImp(RooGaussStepLaurent)
+
+RooGaussStepPowerLaw::RooGaussStepPowerLaw() : _xmax(0.)
+{
+}
+
+RooGaussStepPowerLaw::RooGaussStepPowerLaw(
+    const char* name, const char* title, RooAbsReal& x,
+    RooAbsReal& stepThresh, const RooArgList& powerList,
+    const RooArgList& coefList, Double_t xmax):
+  RooAbsPdf(name, title),
+  _x("x", "Dependent", this, x),
+  _stepThresh("stepThresh", "value where the step starts", this, stepThresh),
+  _powerList("powers", "Power-law exponents", this),
+  _coefList("coefficients", "Power-law coefficients", this),
+  _xmax(xmax)
+{
+  copyRealList(_powerList, powerList, "RooGaussStepPowerLaw", "power", GetName());
+  copyRealList(_coefList, coefList, "RooGaussStepPowerLaw", "coefficient", GetName());
+}
+
+RooGaussStepPowerLaw::RooGaussStepPowerLaw(
+    const RooGaussStepPowerLaw& other, const char* name):
+  RooAbsPdf(other, name),
+  _x("x", this, other._x),
+  _stepThresh("stepThresh", this, other._stepThresh),
+  _powerList("powers", this, other._powerList),
+  _coefList("coefficients", this, other._coefList),
+  _xmax(other._xmax)
+{
+}
+
+Double_t RooGaussStepPowerLaw::evaluate() const
+{
+  const double x = _x;
+  const double step = _stepThresh;
+  if (stepWeight(x, step) <= 0. || _xmax <= step) return 0.;
+
+  const int nTerms = std::min(_powerList.getSize(), _coefList.getSize());
+  double result = 0.;
+  for (int i = 0; i < nTerms; ++i) {
+    const double power = static_cast<RooAbsReal&>(_powerList[i]).getVal();
+    const double coefficient = static_cast<RooAbsReal&>(_coefList[i]).getVal();
+    result += coefficient * powerDensity(x, power, step, _xmax);
+  }
+  return stepWeight(x, step) * result;
+}
+
+Int_t RooGaussStepPowerLaw::getAnalyticalIntegral(
+    RooArgSet& allVars, RooArgSet& analVars, const char* /*rangeName*/) const
+{
+  if (matchArgs(allVars, analVars, _x)) return 1;
+  return 0;
+}
+
+Double_t RooGaussStepPowerLaw::analyticalIntegral(
+    Int_t code, const char* rangeName) const
+{
+  if (code != 1) return 0.;
+  const double lo = _x.min(rangeName);
+  const double hi = _x.max(rangeName);
+  const int nTerms = std::min(_powerList.getSize(), _coefList.getSize());
+  double result = 0.;
+  for (int i = 0; i < nTerms; ++i) {
+    const double power = static_cast<RooAbsReal&>(_powerList[i]).getVal();
+    const double coefficient = static_cast<RooAbsReal&>(_coefList[i]).getVal();
+    result += coefficient * steppedPowerIntegral(lo, hi, power, _stepThresh, _xmax);
+  }
+  return result;
+}
+
+RooGaussStepExponential::RooGaussStepExponential() : _xmax(0.)
+{
+}
+
+RooGaussStepExponential::RooGaussStepExponential(
+    const char* name, const char* title, RooAbsReal& x,
+    RooAbsReal& stepThresh, const RooArgList& slopeList,
+    const RooArgList& coefList, Double_t xmax):
+  RooAbsPdf(name, title),
+  _x("x", "Dependent", this, x),
+  _stepThresh("stepThresh", "value where the step starts", this, stepThresh),
+  _slopeList("slopes", "Exponential slopes", this),
+  _coefList("coefficients", "Exponential coefficients", this),
+  _xmax(xmax)
+{
+  copyRealList(_slopeList, slopeList, "RooGaussStepExponential", "slope", GetName());
+  copyRealList(_coefList, coefList, "RooGaussStepExponential", "coefficient", GetName());
+}
+
+RooGaussStepExponential::RooGaussStepExponential(
+    const RooGaussStepExponential& other, const char* name):
+  RooAbsPdf(other, name),
+  _x("x", this, other._x),
+  _stepThresh("stepThresh", this, other._stepThresh),
+  _slopeList("slopes", this, other._slopeList),
+  _coefList("coefficients", this, other._coefList),
+  _xmax(other._xmax)
+{
+}
+
+Double_t RooGaussStepExponential::evaluate() const
+{
+  const double x = _x;
+  const double step = _stepThresh;
+  if (stepWeight(x, step) <= 0. || _xmax <= step) return 0.;
+
+  const int nTerms = std::min(_slopeList.getSize(), _coefList.getSize());
+  double result = 0.;
+  for (int i = 0; i < nTerms; ++i) {
+    const double slope = static_cast<RooAbsReal&>(_slopeList[i]).getVal();
+    const double coefficient = static_cast<RooAbsReal&>(_coefList[i]).getVal();
+    result += coefficient * exponentialDensity(x, slope, step, _xmax);
+  }
+  return stepWeight(x, step) * result;
+}
+
+Int_t RooGaussStepExponential::getAnalyticalIntegral(
+    RooArgSet& allVars, RooArgSet& analVars, const char* /*rangeName*/) const
+{
+  if (matchArgs(allVars, analVars, _x)) return 1;
+  return 0;
+}
+
+Double_t RooGaussStepExponential::analyticalIntegral(
+    Int_t code, const char* rangeName) const
+{
+  if (code != 1) return 0.;
+  const double lo = _x.min(rangeName);
+  const double hi = _x.max(rangeName);
+  const int nTerms = std::min(_slopeList.getSize(), _coefList.getSize());
+  double result = 0.;
+  for (int i = 0; i < nTerms; ++i) {
+    const double slope = static_cast<RooAbsReal&>(_slopeList[i]).getVal();
+    const double coefficient = static_cast<RooAbsReal&>(_coefList[i]).getVal();
+    result += coefficient * steppedExponentialIntegral(lo, hi, slope,
+                                                       _stepThresh, _xmax);
+  }
+  return result;
+}
+
+RooGaussStepLaurent::RooGaussStepLaurent() : _xmax(0.)
+{
+}
+
+RooGaussStepLaurent::RooGaussStepLaurent(
+    const char* name, const char* title, RooAbsReal& x,
+    RooAbsReal& stepThresh, const RooArgList& powerList,
+    const RooArgList& coefList, Double_t xmax):
+  RooAbsPdf(name, title),
+  _x("x", "Dependent", this, x),
+  _stepThresh("stepThresh", "value where the step starts", this, stepThresh),
+  _powerList("powers", "Laurent exponents", this),
+  _coefList("coefficients", "Laurent coefficients", this),
+  _xmax(xmax)
+{
+  copyRealList(_powerList, powerList, "RooGaussStepLaurent", "power", GetName());
+  copyRealList(_coefList, coefList, "RooGaussStepLaurent", "coefficient", GetName());
+}
+
+RooGaussStepLaurent::RooGaussStepLaurent(
+    const RooGaussStepLaurent& other, const char* name):
+  RooAbsPdf(other, name),
+  _x("x", this, other._x),
+  _stepThresh("stepThresh", this, other._stepThresh),
+  _powerList("powers", this, other._powerList),
+  _coefList("coefficients", this, other._coefList),
+  _xmax(other._xmax)
+{
+}
+
+Double_t RooGaussStepLaurent::evaluate() const
+{
+  const double x = _x;
+  const double step = _stepThresh;
+  if (stepWeight(x, step) <= 0. || _xmax <= step) return 0.;
+
+  const int nTerms = std::min(_powerList.getSize(), _coefList.getSize());
+  double result = 0.;
+  for (int i = 0; i < nTerms; ++i) {
+    const double power = static_cast<RooAbsReal&>(_powerList[i]).getVal();
+    const double coefficient = static_cast<RooAbsReal&>(_coefList[i]).getVal();
+    result += coefficient * powerDensity(x, power, step, _xmax);
+  }
+  return stepWeight(x, step) * result;
+}
+
+Int_t RooGaussStepLaurent::getAnalyticalIntegral(
+    RooArgSet& allVars, RooArgSet& analVars, const char* /*rangeName*/) const
+{
+  if (matchArgs(allVars, analVars, _x)) return 1;
+  return 0;
+}
+
+Double_t RooGaussStepLaurent::analyticalIntegral(
+    Int_t code, const char* rangeName) const
+{
+  if (code != 1) return 0.;
+  const double lo = _x.min(rangeName);
+  const double hi = _x.max(rangeName);
+  const int nTerms = std::min(_powerList.getSize(), _coefList.getSize());
+  double result = 0.;
+  for (int i = 0; i < nTerms; ++i) {
+    const double power = static_cast<RooAbsReal&>(_powerList[i]).getVal();
+    const double coefficient = static_cast<RooAbsReal&>(_coefList[i]).getVal();
+    result += coefficient * steppedPowerIntegral(lo, hi, power, _stepThresh, _xmax);
+  }
+  return result;
+}
+
+namespace {
+
+constexpr int kRooModGausNormBins = 256;
+
+double modGausRawValue(double x, double m0, double vl, double vr,
+                       double s0, double sl, double sh,
+                       double xlow, double xhigh) {
+  if (!(xhigh > xlow) || x < xlow || x > xhigh) return 0.;
+
+  const double power = vl + vr * (x - xlow) / (xhigh - xlow);
+  if (!std::isfinite(power)) return 0.;
+
+  // The historical parameterization allows s0=0.  At the mode the two
+  // One-sided limits are finite in that case, whereas the literal 0/0
+  // expression is not.  Average the available one-sided limits at the mode.
+  if (x == m0 && s0 <= 0.) {
+    double limitSum = 0.;
+    int nLimits = 0;
+    if (m0 > xlow && sl > s0) {
+      const double leftRatio = (m0 - xlow) / (sl - s0);
+      limitSum += std::exp(-std::pow(leftRatio, power));
+      ++nLimits;
+    }
+    if (xhigh > m0 && sh > s0) {
+      const double rightRatio = (xhigh - m0) / (sh - s0);
+      limitSum += std::exp(-std::pow(rightRatio, power));
+      ++nLimits;
+    }
+    return nLimits > 0 ? limitSum / nLimits : 0.;
+  }
+
+  double width = 0.;
+  if (x <= m0 && m0 > xlow) {
+    width = sl + (s0 - sl) * (x - xlow) / (m0 - xlow);
+  } else if (x >= m0 && xhigh > m0) {
+    width = s0 + (sh - s0) * (x - m0) / (xhigh - m0);
+  }
+  if (!(width > 0.) || !std::isfinite(width)) return 0.;
+
+  const double ratio = std::fabs(x - m0) / width;
+  if (ratio == 0.) {
+    if (power < 0.) return 0.;
+    return power == 0. ? std::exp(-1.) : 1.;
+  }
+
+  const double poweredRatio = std::pow(ratio, power);
+  if (!std::isfinite(poweredRatio)) return poweredRatio > 0. ? 0. : 1.;
+  return std::exp(-poweredRatio);
+}
+
+double midpointIntegral(double lo, double hi, double m0, double vl,
+                        double vr, double s0, double sl, double sh,
+                        double xlow, double xhigh) {
+  if (!(hi > lo)) return 0.;
+  const double width = (hi - lo) / kRooModGausNormBins;
+  double result = 0.;
+  for (int i = 0; i < kRooModGausNormBins; ++i) {
+    const double x = lo + (i + 0.5) * width;
+    result += modGausRawValue(x, m0, vl, vr, s0, sl, sh, xlow, xhigh);
+  }
+  return result * width;
+}
+
+double modGausIntegral(double lo, double hi, double m0, double vl,
+                       double vr, double s0, double sl, double sh,
+                       double xlow, double xhigh) {
+  const double clippedLo = std::max(lo, xlow);
+  const double clippedHi = std::min(hi, xhigh);
+  if (!(clippedHi > clippedLo)) return 0.;
+
+  const double split = std::min(std::max(m0, clippedLo), clippedHi);
+  return midpointIntegral(clippedLo, split, m0, vl, vr, s0, sl, sh,
+                          xlow, xhigh) +
+         midpointIntegral(split, clippedHi, m0, vl, vr, s0, sl, sh,
+                          xlow, xhigh);
+}
+
+double normalCdf(double value) {
+  return 0.5 * TMath::Erfc(-value / std::sqrt(2.));
+}
+
+double expModGaussCdf(double x, double mu, double sigma, double lambda) {
+  if (!(sigma > 0.) || !(lambda > 0.)) return 0.;
+  const double a = (x - mu) / sigma;
+  const double b = a - lambda * sigma;
+  const double exponent = -lambda * (x - mu) +
+                          0.5 * lambda * lambda * sigma * sigma;
+  const double tailCdf = normalCdf(b);
+  if (!(tailCdf > 0.)) return normalCdf(a);
+  const double logTail = exponent + std::log(tailCdf);
+  if (!std::isfinite(logTail)) return logTail > 0. ? 0. : normalCdf(a);
+  if (logTail >= std::log(std::numeric_limits<double>::max())) return 0.;
+  const double tail = logTail <= std::log(std::numeric_limits<double>::min())
+                          ? 0.
+                          : std::exp(logTail);
+  return std::min(std::max(normalCdf(a) - tail, 0.), 1.);
+}
+
+}  // namespace
+
+ClassImp(RooModGaus)
+
+RooModGaus::RooModGaus()
+    : RooAbsPdf(),
+      _xlow(0.), _xhigh(0.), _norm(1.),
+      _lastM0(0.), _lastVl(0.), _lastVr(0.), _lastS0(0.),
+      _lastSl(0.), _lastSh(0.), _normValid(false) {
+}
+
+RooModGaus::RooModGaus(const char* name, const char* title, RooAbsReal& x,
+                       RooAbsReal& m0, RooAbsReal& vl, RooAbsReal& vr,
+                       RooAbsReal& s0, RooAbsReal& sl, RooAbsReal& sh,
+                       Double_t xlow, Double_t xhigh)
+    : RooAbsPdf(name, title),
+      _x("x", "Dependent", this, x),
+      _m0("m0", "mode", this, m0),
+      _vl("vl", "left power", this, vl),
+      _vr("vr", "power slope", this, vr),
+      _s0("s0", "mode width", this, s0),
+      _sl("sl", "left width", this, sl),
+      _sh("sh", "right width", this, sh),
+      _xlow(xlow), _xhigh(xhigh), _norm(1.),
+      _lastM0(0.), _lastVl(0.), _lastVr(0.), _lastS0(0.),
+      _lastSl(0.), _lastSh(0.), _normValid(false) {
+}
+
+RooModGaus::RooModGaus(const RooModGaus& other, const char* name)
+    : RooAbsPdf(other, name),
+      _x("x", this, other._x),
+      _m0("m0", this, other._m0),
+      _vl("vl", this, other._vl),
+      _vr("vr", this, other._vr),
+      _s0("s0", this, other._s0),
+      _sl("sl", this, other._sl),
+      _sh("sh", this, other._sh),
+      _xlow(other._xlow), _xhigh(other._xhigh), _norm(other._norm),
+      _lastM0(other._lastM0), _lastVl(other._lastVl),
+      _lastVr(other._lastVr), _lastS0(other._lastS0),
+      _lastSl(other._lastSl), _lastSh(other._lastSh),
+      _normValid(other._normValid) {
+}
+
+void RooModGaus::updateNormCache() const {
+  const double m0 = _m0;
+  const double vl = _vl;
+  const double vr = _vr;
+  const double s0 = _s0;
+  const double sl = _sl;
+  const double sh = _sh;
+  if (!_normValid || m0 != _lastM0 || vl != _lastVl || vr != _lastVr ||
+      s0 != _lastS0 || sl != _lastSl || sh != _lastSh) {
+    _norm = modGausIntegral(_xlow, _xhigh, m0, vl, vr, s0, sl, sh,
+                            _xlow, _xhigh);
+    if (!std::isfinite(_norm) || !(_norm > 0.)) _norm = 1.;
+    _lastM0 = m0;
+    _lastVl = vl;
+    _lastVr = vr;
+    _lastS0 = s0;
+    _lastSl = sl;
+    _lastSh = sh;
+    _normValid = true;
+  }
+}
+
+Double_t RooModGaus::evaluate() const {
+  updateNormCache();
+  const double m0 = _m0;
+  const double vl = _vl;
+  const double vr = _vr;
+  const double s0 = _s0;
+  const double sl = _sl;
+  const double sh = _sh;
+  return modGausRawValue(_x, m0, vl, vr, s0, sl, sh, _xlow, _xhigh) /
+         _norm;
+}
+
+Int_t RooModGaus::getAnalyticalIntegral(RooArgSet& allVars,
+                                        RooArgSet& analVars,
+                                        const char* /*rangeName*/) const {
+  if (matchArgs(allVars, analVars, _x)) return 1;
+  return 0;
+}
+
+Double_t RooModGaus::analyticalIntegral(Int_t code,
+                                        const char* rangeName) const {
+  if (code != 1) return 0.;
+  updateNormCache();
+  return modGausIntegral(_x.min(rangeName), _x.max(rangeName), _m0, _vl, _vr,
+                         _s0, _sl, _sh, _xlow, _xhigh) / _norm;
+}
+
+ClassImp(RooExpModGauss)
+
+RooExpModGauss::RooExpModGauss() : RooAbsPdf() {
+}
+
+RooExpModGauss::RooExpModGauss(const char* name, const char* title,
+                               RooAbsReal& x, RooAbsReal& mu,
+                               RooAbsReal& sigma, RooAbsReal& lambda)
+    : RooAbsPdf(name, title),
+      _x("x", "Dependent", this, x),
+      _mu("mu", "Gaussian mean", this, mu),
+      _sigma("sigma", "Gaussian width", this, sigma),
+      _lambda("lambda", "Exponential rate", this, lambda) {
+}
+
+RooExpModGauss::RooExpModGauss(const RooExpModGauss& other,
+                               const char* name)
+    : RooAbsPdf(other, name),
+      _x("x", this, other._x),
+      _mu("mu", this, other._mu),
+      _sigma("sigma", this, other._sigma),
+      _lambda("lambda", this, other._lambda) {
+}
+
+Double_t RooExpModGauss::evaluate() const {
+  const double sigma = _sigma;
+  const double lambda = _lambda;
+  if (!(sigma > 0.) || !(lambda > 0.)) return 0.;
+
+  const double arg = (_mu + lambda * sigma * sigma - _x) /
+                     (std::sqrt(2.) * sigma);
+  const double erfcValue = TMath::Erfc(arg);
+  if (!(erfcValue > 0.)) return 0.;
+
+  const double logValue = std::log(lambda * 0.5) +
+                          lambda * (_mu - _x) +
+                          0.5 * lambda * lambda * sigma * sigma +
+                          std::log(erfcValue);
+  if (logValue < std::log(std::numeric_limits<double>::min())) return 0.;
+  if (logValue > std::log(std::numeric_limits<double>::max())) return
+      std::numeric_limits<double>::max();
+  if (!std::isfinite(logValue)) return logValue > 0. ?
+      std::numeric_limits<double>::max() : 0.;
+  return std::exp(logValue);
+}
+
+Int_t RooExpModGauss::getAnalyticalIntegral(
+    RooArgSet& allVars, RooArgSet& analVars,
+    const char* /*rangeName*/) const {
+  if (matchArgs(allVars, analVars, _x)) return 1;
+  return 0;
+}
+
+Double_t RooExpModGauss::analyticalIntegral(Int_t code,
+                                            const char* rangeName) const {
+  if (code != 1) return 0.;
+  const double lo = _x.min(rangeName);
+  const double hi = _x.max(rangeName);
+  return std::max(0., expModGaussCdf(hi, _mu, _sigma, _lambda) -
+                         expModGaussCdf(lo, _mu, _sigma, _lambda));
 }
