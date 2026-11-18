@@ -8,8 +8,33 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <tuple>
+#include <utility>
 namespace {
 using Real=long double;
+
+// All inputs are numerical values. Threads and independent PDFs can reuse a
+// result without retaining RooFit objects or adding state to the dictionary.
+template <typename Key, typename Value, std::size_t Capacity>
+class IntegralCache {
+ public:
+  template <typename Compute>
+  const Value& get(const Key& key, Compute compute) {
+    for (std::size_t i = 0; i < size_; ++i) {
+      if (entries_[i].first == key) return entries_[i].second;
+    }
+    auto& entry = entries_[next_];
+    entry = {key, compute()};
+    next_ = (next_ + 1) % Capacity;
+    if (size_ < Capacity) ++size_;
+    return entry.second;
+  }
+
+ private:
+  std::array<std::pair<Key, Value>, Capacity> entries_{};
+  std::size_t size_ = 0, next_ = 0;
+};
+
 const Real pi=acosl(-1.L), sqrt2=sqrtl(2.L);
 Real phi(Real z) { return expl(-z*z/2)/sqrtl(2*pi); }
 Real Phi(Real z) { return erfcl(-z/sqrt2)/2; }
@@ -118,7 +143,11 @@ Double_t RooErfProductPdf::analyticalIntegral(Int_t code,const char* range) cons
  Real result=0;
  if(mode==0) {
   updateTailCache();
-  const auto moments=erfMoments(pars.size(),(lo-L)/D,(hi-L)/D,(t-L)/D,s/D);
+  const auto degree = pars.size();
+  const Real a=(lo-L)/D, b=(hi-L)/D, threshold=(t-L)/D, width=s/D;
+  using MomentKey = std::tuple<std::size_t, Real, Real, Real, Real>;
+  static thread_local IntegralCache<MomentKey,std::array<Real,9>,4> momentCache;
+  const auto& moments = momentCache.get({degree,a,b,threshold,width}, [&] { return erfMoments(degree,a,b,threshold,width); });
   for(size_t i=0;i<cachePower.size();++i)result+=cachePower[i]*moments[i];
   result*=D;
  } else {
@@ -126,7 +155,13 @@ Double_t RooErfProductPdf::analyticalIntegral(Int_t code,const char* range) cons
   for(size_t i=0;i<pars.size();++i) {
    const Real f=i<fractions.size()?get(fractions,i):1-used;used+=f;
    const Real k=get(pars,i),anchor=k<=0?L:H;
-   result+=f*expIntegral(lo,hi,t,s,k,anchor,D)/expNorm(k,D);
+   static thread_local IntegralCache<std::array<Real,7>,Real,12> numerators;
+   static thread_local IntegralCache<std::array<Real,2>,Real,6> denominators;
+   const Real numerator = numerators.get({lo,hi,t,s,k,anchor,D}, [&] {
+     return expIntegral(lo,hi,t,s,k,anchor,D);
+   });
+   const Real denominator = denominators.get({k,D}, [&] { return expNorm(k,D); });
+   result += f*numerator/denominator;
   }
  }
  return static_cast<double>(result);

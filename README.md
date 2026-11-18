@@ -32,3 +32,10 @@ in a workspace still require their own dictionaries.
 
 Run `python3 test/test_hzg_erf_workspace.py` in the built environment to write
 all six families and read their normalized densities in a fresh process.
+
+On the `hzg/erf-integral-reuse` candidate branch, `RooErfProductPdf` reuses
+Bernstein integration moments and the exponential components' integral
+numerators and denominators. The bounded caches use the numerical inputs
+of each calculation and are local to each thread. Run
+`python3 test/test_hzg_erf_integrals.py` to compare the resulting integrals
+to independent quadrature after changing the geometry and shape parameters.
