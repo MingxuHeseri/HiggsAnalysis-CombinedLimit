@@ -30,6 +30,7 @@ RooPowerErfPdf::RooPowerErfPdf(const char* name,const char* title,RooAbsReal& ma
  powers.add(p);fractions.add(f);
  // Retain relative accuracy for small normalization integrals.
  auto* config = specialIntegratorConfig(true);
+ config->method1D().setLabel("RooAdaptiveGaussKronrodIntegrator1D");
  config->setEpsAbs(1e-50);
  config->setEpsRel(1e-10);
 }

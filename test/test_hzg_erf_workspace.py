@@ -15,6 +15,10 @@ def values(workspace):
     result = []
     for name in ("bern", "exp", "power", "laurent", "expbern", "expcheb"):
         pdf = workspace.pdf(name)
+        if name in ("power", "laurent"):
+            config = pdf.getIntegratorConfig()
+            assert config.method1D().getLabel() == "RooAdaptiveGaussKronrodIntegrator1D"
+            assert (config.epsAbs(), config.epsRel()) == (1e-50, 1e-10)
         for mass in (97., 101., 125., 145., 162.):
             x.setVal(mass)
             value = pdf.getVal(obs)
