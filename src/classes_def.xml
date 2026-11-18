@@ -226,5 +226,13 @@
   <class name="RooSumTwoExpPdf" />
   <class name="RooPowerLawPdf" />
   <class name="RooSumTwoPowerLawPdf" />
+  <class name="RooHZGErfTurnOnPdf" />
+  <class name="RooHZGErfExpPdf" />
+  <class name="RooHZGPowerExpPdf" />
+  <class name="RooErfBernsteinPdf" />
+  <class name="RooFkpPdf" />
+  <class name="RooErfProductPdf" />
+  <class name="RooExpPolyErfPdf" />
+  <class name="RooPowerErfPdf" />
   <class name="CombineUtils" />
 </lcgdict>
