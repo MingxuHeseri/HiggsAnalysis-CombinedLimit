@@ -1,6 +1,7 @@
 #include "HiggsAnalysis/CombinedLimit/interface/RooErfProductPdf.h"
 #include "RooArgList.h"
 #include "RooArgSet.h"
+#include <boost/math/quadrature/gauss.hpp>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -80,6 +81,20 @@ Real expIntegral(Real lo,Real hi,Real t,Real s,Real k,Real anchor,Real span) {
 }
 Real expNorm(Real k,Real span) { return k==0 ? span : (k<0 ? expm1l(k*span)/k : -expm1l(-k*span)/k); }
 Real get(const RooListProxy& list,int i) { return static_cast<const RooAbsReal&>(list[i]).getVal(); }
+// Accumulate b_i C(n,i) u^i (1-u)^(n-i) with b_0=1. On the mass
+// interval positive coefficients stay positive throughout the recurrence.
+Real bernsteinTail(const std::vector<double>& ratios, Real u, Real complement) {
+ static constexpr unsigned binomial[][6] = {
+   {1}, {1,1}, {1,2,1}, {1,3,3,1}, {1,4,6,4,1}, {1,5,10,10,5,1}
+ };
+ const auto* row = binomial[ratios.size()];
+ Real value = 1, power = 1;
+ for (std::size_t i = 0; i < ratios.size(); ++i) {
+   power *= u;
+   value = complement * value + (power * row[i+1]) * ratios[i];
+ }
+ return value;
+}
 std::vector<Real> powerCoefficients(const RooListProxy& p) {
  int n=p.size();std::vector<Real> a(n+1,0);
  for(int i=0;i<=n;++i)for(int j=i;j<=n;++j)
@@ -91,7 +106,9 @@ ClassImp(RooErfProductPdf)
 RooErfProductPdf::RooErfProductPdf(const char* n,const char* title,RooAbsReal& v,RooAbsReal& t,RooAbsReal& s,const RooArgList& p,const RooArgList& f,int m):
  RooAbsPdf(n,title),x("x","mass",this,v),step("step","threshold",this,t),sigma("sigma","Gaussian width",this,s),pars("pars","tail parameters",this),fractions("fractions","normalized component fractions",this),mode(m) {
  pars.add(p);fractions.add(f);
- if((m==0&&(p.size()<1||p.size()>5||f.size()!=0))||(m==1&&(p.size()<1||f.size()!=p.size()-1))||(m!=0&&m!=1))throw std::invalid_argument("unsupported erf-product specification");
+ const bool bernstein = m == 0 && p.size() >= 1 && p.size() <= 5 && f.empty();
+ const bool exponential = m == 1 && p.size() >= 1 && (f.size() == p.size() || f.size() + 1 == p.size());
+ if (!bernstein && !exponential) throw std::invalid_argument("unsupported erf-product specification");
 }
 RooErfProductPdf::RooErfProductPdf(const RooErfProductPdf& o,const char* n):RooAbsPdf(o,n),x("x",this,o.x),step("step",this,o.step),sigma("sigma",this,o.sigma),pars("pars",this,o.pars),fractions("fractions",this,o.fractions),mode(o.mode) {}
 void RooErfProductPdf::updateTailCache() const {
@@ -117,8 +134,7 @@ Double_t RooErfProductPdf::evaluate() const {
  updateTailCache();
  Real tail=0;
  if(mode==0) {
-  const Real u=(v-L)/D;
-  for(auto it=cachePower.rbegin();it!=cachePower.rend();++it)tail=tail*u+*it;
+  tail=bernsteinTail(cacheKey,(v-L)/D,(H-v)/D);
  } else {
   Real used=0;
   for(size_t i=0;i<pars.size();++i) {
@@ -143,6 +159,23 @@ Double_t RooErfProductPdf::analyticalIntegral(Int_t code,const char* range) cons
  Real result=0;
  if(mode==0) {
   updateTailCache();
+  // A difference of global moments loses precision for narrow intervals at
+  // the upper endpoint. Integrate positive Bernstein terms in bin coordinates
+  // when the turn-on is flat, or smooth over at most one Gaussian width.
+  const Real span = hi - lo;
+  const bool plateau = (lo - t) >= 9 * s;
+  if (plateau || (lo >= t && span <= s)) {
+    const auto tail = [&](Real z) {
+      return bernsteinTail(cacheKey, ((lo - L) + z * span) / D,
+                                     ((H - hi) + (1 - z) * span) / D);
+    };
+    using boost::math::quadrature::gauss;
+    // Three nodes integrate every supported Bernstein degree exactly. At
+    // nine sigma the omitted Gaussian survival probability is below 2e-19.
+    if (plateau) return static_cast<double>(span * gauss<Real,3>::integrate(tail, 0, 1));
+    const auto density = [&](Real z) { return tail(z) * Phi(((lo - t) + z * span) / s); };
+    return static_cast<double>(span * gauss<Real,10>::integrate(density, 0, 1));
+  }
   const auto degree = pars.size();
   const Real a=(lo-L)/D, b=(hi-L)/D, threshold=(t-L)/D, width=s/D;
   using MomentKey = std::tuple<std::size_t, Real, Real, Real, Real>;

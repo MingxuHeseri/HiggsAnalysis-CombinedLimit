@@ -26,7 +26,8 @@ RooPowerErfPdf::RooPowerErfPdf(const char* name,const char* title,RooAbsReal& ma
  RooAbsPdf(name,title),x("x","mass",this,mass),step("step","threshold",this,threshold),
  sigma("sigma","Gaussian width",this,width),powers("powers","component powers",this),
  fractions("fractions","normalized component fractions",this) {
- if(p.size()<1||p.size()>6||f.size()!=p.size()-1)throw std::invalid_argument("unsupported power-erf mixture");
+ if (p.size() < 1 || p.size() > 6 || (f.size() != p.size() && f.size() + 1 != p.size()))
+   throw std::invalid_argument("unsupported power-erf mixture");
  powers.add(p);fractions.add(f);
  // Retain relative accuracy for small normalization integrals.
  auto* config = specialIntegratorConfig(true);

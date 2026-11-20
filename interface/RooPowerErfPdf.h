@@ -11,6 +11,8 @@
 class RooPowerErfPdf : public RooAbsPdf {
 public:
  RooPowerErfPdf()=default;
+ // Supply all normalized fractions when available. With n-1 fractions the
+ // final component retains the RooAddPdf complement convention.
  RooPowerErfPdf(const char*,const char*,RooAbsReal&,RooAbsReal&,RooAbsReal&,
                 const RooArgList&,const RooArgList&);
  RooPowerErfPdf(const RooPowerErfPdf&,const char* =nullptr);

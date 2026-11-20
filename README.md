@@ -33,9 +33,35 @@ in a workspace still require their own dictionaries.
 Run `python3 test/test_hzg_erf_workspace.py` in the built environment to write
 all six families and read their normalized densities in a fresh process.
 
-On the `hzg/erf-integral-reuse` candidate branch, `RooErfProductPdf` reuses
+This branch includes the integral-reuse and power-erf integration updates.
+`RooErfProductPdf` reuses
 Bernstein integration moments and the exponential components' integral
 numerators and denominators. The bounded caches use the numerical inputs
-of each calculation and are local to each thread. Run
-`python3 test/test_hzg_erf_integrals.py` to compare the resulting integrals
-to independent quadrature after changing the geometry and shape parameters.
+of each calculation and are local to each thread. Newly constructed
+`RooPowerErfPdf` objects select finite-range adaptive Gauss-Kronrod integration
+with absolute and relative tolerances of `1e-50` and `1e-10`.
+
+Exponential, PowerLaw and Laurent mixtures accept either all `n` normalized
+fractions or the legacy `n-1` fractions with a final complement. To retain tiny
+components, pass every weight explicitly as `c_i / sum(c_j)`; the PDF does not
+normalize supplied fractions for the caller. Existing workspaces retain their
+stored fraction convention. FinalFit factories must pass all fractions to use
+this improvement.
+
+Bernstein point evaluation uses the original Bernstein basis to avoid
+cancellation near the upper endpoint. Narrow intervals above the turn-on use
+fixed Gauss-Legendre quadrature; saturated intervals use a rule exact for the
+supported polynomial degrees. Other intervals retain the analytic moments.
+
+After building, run the numerical and fresh-process workspace checks:
+
+```bash
+python3 test/test_hzg_erf_integrals.py
+python3 test/test_hzg_erf_mixture_fractions.py
+python3 test/test_hzg_erf_workspace.py
+```
+
+These check independent integral references, explicit and legacy fractions,
+CPU NLL evaluation, and serialization. They do not establish analysis-specific
+bias or coverage acceptance. The numerical updates were checked with ROOT
+6.36.07 on CERN Linux and ROOT 6.36.08 on macOS; use a compatible build environment.

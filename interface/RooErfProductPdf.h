@@ -8,7 +8,8 @@
 class RooErfProductPdf : public RooAbsPdf {
 public:
   RooErfProductPdf() = default;
-  // mode=0: Bernstein ratios b1..bn (b0=1); mode=1: slopes, n-1 fractions.
+  // mode=0: Bernstein ratios b1..bn (b0=1).
+  // mode=1: slopes and all normalized fractions, or n-1 plus an implicit remainder.
   RooErfProductPdf(const char*,const char*,RooAbsReal&,RooAbsReal&,RooAbsReal&,
                    const RooArgList&,const RooArgList&,int);
   RooErfProductPdf(const RooErfProductPdf&,const char* = nullptr);
